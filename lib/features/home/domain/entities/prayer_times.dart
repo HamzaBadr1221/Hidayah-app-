@@ -8,6 +8,7 @@ class PrayerTimes {
   final String hijriDate;
   final String city;
   final String country;
+  final String timezone;
 
   const PrayerTimes({
     required this.fajr,
@@ -19,5 +20,6 @@ class PrayerTimes {
     required this.hijriDate,
     required this.city,
     required this.country,
+    required this.timezone,
   });
 }

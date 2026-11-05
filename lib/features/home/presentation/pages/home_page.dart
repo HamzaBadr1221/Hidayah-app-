@@ -3,6 +3,8 @@ import 'package:flutter/material.dart';
 import 'package:flutter_bloc/flutter_bloc.dart';
 import 'package:go_router/go_router.dart';
 import 'package:intl/intl.dart';
+import 'package:shared_preferences/shared_preferences.dart';
+import 'package:timezone/timezone.dart' as tz;
 import 'curved_image_clipper.dart';
 import '../../../../core/cubit/theme_cubit.dart';
 import '../../../../core/di/injection_container.dart';
@@ -18,13 +20,20 @@ class HomePage extends StatefulWidget {
 
 class _HomePageState extends State<HomePage> {
   Timer? _clockTimer;
+
   DateTime _now = DateTime.now();
+  tz.Location? _location;
 
   int? _lastSurahNumber;
   int? _lastPageNumber;
   bool _loadingLastRead = true;
 
+  String _userName = '';
+  String _selectedCity = '';
+  String _selectedCountry = '';
+
   final Set<String> _prayed = <String>{};
+  String _currentTrackerDate = '';
 
   // Dark Mode Colors
   static const Color _darkBackground = Color(0xFF171B1C);
@@ -81,17 +90,289 @@ class _HomePageState extends State<HomePage> {
   @override
   void initState() {
     super.initState();
+
+    _currentTrackerDate = _getTodayKey();
+
+    _loadPrayerTracker();
     _scheduleNextMinute();
     _loadLastRead();
 
     WidgetsBinding.instance.addPostFrameCallback((_) {
-      if (!mounted) return;
-
-      context.read<HomeCubit>().fetchPrayerTimes(
-        city: 'Cairo',
-        country: 'Egypt',
-      );
+      _loadUserProfileAndPrayerTimes();
     });
+  }
+
+  DateTime _cityNow() {
+    if (_location == null) {
+      return DateTime.now();
+    }
+
+    return tz.TZDateTime.now(_location!);
+  }
+
+  DateTime _makeCityDateTime(
+      int year,
+      int month,
+      int day,
+      int hour,
+      int minute,
+      ) {
+    if (_location == null) {
+      return DateTime(year, month, day, hour, minute);
+    }
+
+    return tz.TZDateTime(
+      _location!,
+      year,
+      month,
+      day,
+      hour,
+      minute,
+    );
+  }
+
+  Future<void> _loadUserProfileAndPrayerTimes() async {
+    final prefs = await SharedPreferences.getInstance();
+
+    final name = prefs.getString('profile_name') ?? 'Hamza';
+    final city = prefs.getString('profile_city') ?? 'Cairo';
+    final country = prefs.getString('profile_country') ?? 'Egypt';
+
+    if (!mounted) return;
+
+    setState(() {
+      _userName = name;
+      _selectedCity = city;
+      _selectedCountry = country;
+    });
+
+    await context.read<HomeCubit>().fetchPrayerTimes(
+      city: city,
+      country: country,
+    );
+
+    if (!mounted) return;
+
+    final prayerTimes = context.read<HomeCubit>().prayerTimes;
+
+    if (prayerTimes != null) {
+      try {
+        _location = tz.getLocation(prayerTimes.timezone);
+      } catch (error) {
+        debugPrint('Timezone error: $error');
+      }
+    }
+
+    _currentTrackerDate = _getTodayKey();
+
+    await _loadPrayerTracker();
+
+    if (!mounted) return;
+
+    setState(() {
+      _now = _cityNow();
+    });
+
+    _scheduleNextMinute();
+  }
+
+  String _getTodayKey() {
+    return DateFormat('yyyy-MM-dd').format(_cityNow());
+  }
+
+  String _getPrayerStorageKey() {
+    return 'prayed_${_getTodayKey()}';
+  }
+
+  Future<void> _loadPrayerTracker() async {
+    final prefs = await SharedPreferences.getInstance();
+
+    final savedPrayers =
+        prefs.getStringList(_getPrayerStorageKey()) ?? [];
+
+    if (!mounted) return;
+
+    setState(() {
+      _prayed
+        ..clear()
+        ..addAll(savedPrayers);
+
+      _currentTrackerDate = _getTodayKey();
+    });
+  }
+
+  Future<void> _savePrayerTracker() async {
+    final prefs = await SharedPreferences.getInstance();
+
+    await prefs.setStringList(
+      _getPrayerStorageKey(),
+      _prayed.toList(),
+    );
+  }
+
+  Future<void> _togglePrayer(String name) async {
+    setState(() {
+      if (_prayed.contains(name)) {
+        _prayed.remove(name);
+      } else {
+        _prayed.add(name);
+      }
+    });
+
+    await _savePrayerTracker();
+  }
+
+  void _handlePrayerTap(String name) {
+    if (_prayed.contains(name)) {
+      _togglePrayer(name);
+      return;
+    }
+
+    final prayerTimes = context.read<HomeCubit>().prayerTimes;
+
+    if (prayerTimes == null) {
+      _showPrayerDialog(
+        title: 'مواقيت الصلاة غير متاحة',
+        message: 'لم يتم تحميل مواقيت الصلاة بعد. حاول مرة أخرى.',
+        icon: Icons.cloud_off_rounded,
+      );
+      return;
+    }
+
+    final String? prayerTime = switch (name) {
+      'Fajr' => prayerTimes.fajr,
+      'Dhuhr' => prayerTimes.dhuhr,
+      'Asr' => prayerTimes.asr,
+      'Maghrib' => prayerTimes.maghrib,
+      'Isha' => prayerTimes.isha,
+      _ => null,
+    };
+
+    if (prayerTime == null) return;
+
+    final match =
+    RegExp(r'(\d{1,2}):(\d{2})').firstMatch(prayerTime);
+
+    if (match == null) return;
+
+    final hour = int.parse(match.group(1)!);
+    final minute = int.parse(match.group(2)!);
+
+    final now = _cityNow();
+
+    final prayerDate = _makeCityDateTime(
+      now.year,
+      now.month,
+      now.day,
+      hour,
+      minute,
+    );
+
+    if (now.isBefore(prayerDate)) {
+      final arabicName = _trackedPrayers.firstWhere(
+            (prayer) => prayer['name'] == name,
+      )['arabic']!;
+
+      _showPrayerDialog(
+        title: 'مهلك قليلا',
+        message:
+        'لم يحن وقت صلاة $arabicName بعد يمكنك تسجيلها عند دخول وقتها',
+        icon: Icons.access_time_rounded,
+      );
+
+      return;
+    }
+
+    _togglePrayer(name);
+  }
+
+  void _showPrayerDialog({
+    required String title,
+    required String message,
+    required IconData icon,
+  }) {
+    final isDark = Theme.of(context).brightness == Brightness.dark;
+
+    showDialog(
+      context: context,
+      barrierDismissible: true,
+      builder: (dialogContext) {
+        return Dialog(
+          backgroundColor: isDark ? _darkSurface : Colors.white,
+          shape: RoundedRectangleBorder(
+            borderRadius: BorderRadius.circular(28),
+          ),
+          child: Padding(
+            padding: const EdgeInsets.all(24),
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                Container(
+                  width: 68,
+                  height: 68,
+                  decoration: BoxDecoration(
+                    color: (isDark ? _darkAccent : _darkPrimary)
+                        .withValues(alpha: 0.15),
+                    shape: BoxShape.circle,
+                  ),
+                  child: Icon(
+                    icon,
+                    color: isDark ? _darkAccent : _darkPrimary,
+                    size: 34,
+                  ),
+                ),
+                const SizedBox(height: 20),
+                Text(
+                  title,
+                  textAlign: TextAlign.center,
+                  style: TextStyle(
+                    color: isDark
+                        ? _darkText
+                        : const Color(0xFF173D31),
+                    fontSize: 19,
+                    fontWeight: FontWeight.bold,
+                  ),
+                ),
+                const SizedBox(height: 10),
+                Text(
+                  message,
+                  textAlign: TextAlign.center,
+                  style: TextStyle(
+                    color: isDark
+                        ? _darkSecondaryText
+                        : Colors.black54,
+                    fontSize: 14,
+                    height: 1.6,
+                  ),
+                ),
+                const SizedBox(height: 24),
+                SizedBox(
+                  width: double.infinity,
+                  child: FilledButton(
+                    onPressed: () => Navigator.pop(dialogContext),
+                    style: FilledButton.styleFrom(
+                      backgroundColor: _darkPrimary,
+                      foregroundColor: Colors.white,
+                      padding: const EdgeInsets.symmetric(vertical: 14),
+                      shape: RoundedRectangleBorder(
+                        borderRadius: BorderRadius.circular(15),
+                      ),
+                    ),
+                    child: const Text(
+                      'حسنا',
+                      style: TextStyle(
+                        fontWeight: FontWeight.bold,
+                        fontSize: 15,
+                      ),
+                    ),
+                  ),
+                ),
+              ],
+            ),
+          ),
+        );
+      },
+    );
   }
 
   Future<void> _loadLastRead() async {
@@ -122,7 +403,7 @@ class _HomePageState extends State<HomePage> {
   void _scheduleNextMinute() {
     _clockTimer?.cancel();
 
-    final now = DateTime.now();
+    final now = _cityNow();
     final secondsUntilNextMinute = 60 - now.second;
 
     _clockTimer = Timer(
@@ -133,9 +414,15 @@ class _HomePageState extends State<HomePage> {
           () {
         if (!mounted) return;
 
+        final today = _getTodayKey();
+
         setState(() {
-          _now = DateTime.now();
+          _now = _cityNow();
         });
+
+        if (today != _currentTrackerDate) {
+          _loadPrayerTracker();
+        }
 
         _scheduleNextMinute();
       },
@@ -201,13 +488,15 @@ class _HomePageState extends State<HomePage> {
               children: [
                 Image.asset(
                   isDark
-                  ?'assets/images/mosque_night.webp.jpg'
-                  :'assets/images/mosque_light.webp.jpg',
+                      ? 'assets/images/mosque_night.webp.jpg'
+                      : 'assets/images/mosque_light.webp.jpg',
                   fit: BoxFit.cover,
                   alignment: Alignment.center,
                   errorBuilder: (context, error, stackTrace) {
                     return Container(
-                      color: isDark ? _darkSurface : const Color(0xFF063D32),
+                      color: isDark
+                          ? _darkSurface
+                          : const Color(0xFF063D32),
                     );
                   },
                 ),
@@ -219,7 +508,9 @@ class _HomePageState extends State<HomePage> {
                       colors: [
                         Colors.black.withValues(alpha: 0.42),
                         Colors.transparent,
-                        (isDark ? _darkBackground : const Color(0xFF062D26))
+                        (isDark
+                            ? _darkBackground
+                            : const Color(0xFF062D26))
                             .withValues(alpha: 0.96),
                       ],
                       stops: const [0.0, 0.48, 1.0],
@@ -239,11 +530,11 @@ class _HomePageState extends State<HomePage> {
                   Row(
                     crossAxisAlignment: CrossAxisAlignment.start,
                     children: [
-                      const Expanded(
+                      Expanded(
                         child: Column(
                           crossAxisAlignment: CrossAxisAlignment.start,
                           children: [
-                            Text(
+                            const Text(
                               'Assalamu Alaikum,',
                               style: TextStyle(
                                 color: Colors.white,
@@ -251,13 +542,22 @@ class _HomePageState extends State<HomePage> {
                                 fontWeight: FontWeight.w500,
                               ),
                             ),
-                            SizedBox(height: 3),
+                            const SizedBox(height: 3),
                             Text(
-                              'Hamza 👋',
-                              style: TextStyle(
+                              '$_userName 👋',
+                              style: const TextStyle(
                                 color: Colors.white,
                                 fontSize: 34,
                                 fontWeight: FontWeight.bold,
+                              ),
+                            ),
+                            const SizedBox(height: 5),
+                            Text(
+                              '$_selectedCity, $_selectedCountry',
+                              style: const TextStyle(
+                                color: Colors.white70,
+                                fontSize: 13,
+                                fontWeight: FontWeight.w500,
                               ),
                             ),
                           ],
@@ -290,13 +590,16 @@ class _HomePageState extends State<HomePage> {
                       child: Text(
                         DateFormat('hh:mm').format(_now),
                         style: TextStyle(
-                          color: isDark ? _darkText : const Color(0xFF087F5B),
+                          color: isDark
+                              ? _darkText
+                              : const Color(0xFF087F5B),
                           fontSize: 68,
                           fontWeight: FontWeight.bold,
                           letterSpacing: 1.5,
                           shadows: [
                             Shadow(
-                              color: isDark ? Colors.black54 : Colors.black12,
+                              color:
+                              isDark ? Colors.black54 : Colors.black12,
                               blurRadius: 18,
                             ),
                           ],
@@ -345,7 +648,9 @@ class _HomePageState extends State<HomePage> {
           ),
           const SizedBox(height: 12),
           Divider(
-            color: isDark ? _darkSecondaryText.withValues(alpha: 0.3) : Colors.white30,
+            color: isDark
+                ? _darkSecondaryText.withValues(alpha: 0.3)
+                : Colors.white30,
           ),
           const SizedBox(height: 8),
           BlocBuilder<HomeCubit, HomeStatus>(
@@ -454,8 +759,8 @@ class _HomePageState extends State<HomePage> {
                 FilledButton(
                   onPressed: () {
                     context.read<HomeCubit>().fetchPrayerTimes(
-                      city: 'Cairo',
-                      country: 'Egypt',
+                      city: _selectedCity,
+                      country: _selectedCountry,
                     );
                   },
                   child: const Text('إعادة المحاولة'),
@@ -477,7 +782,9 @@ class _HomePageState extends State<HomePage> {
         DateTime? parsePrayerTime(String? rawTime) {
           if (rawTime == null) return null;
 
-          final match = RegExp(r'(\d{1,2}):(\d{2})').firstMatch(rawTime);
+          final match =
+          RegExp(r'(\d{1,2}):(\d{2})').firstMatch(rawTime);
+
           if (match == null) return null;
 
           final hour = int.tryParse(match.group(1)!);
@@ -490,7 +797,7 @@ class _HomePageState extends State<HomePage> {
             return null;
           }
 
-          return DateTime(
+          return _makeCityDateTime(
             _now.year,
             _now.month,
             _now.day,
@@ -499,7 +806,13 @@ class _HomePageState extends State<HomePage> {
           );
         }
 
-        const prayerOrder = ['Fajr', 'Dhuhr', 'Asr', 'Maghrib', 'Isha'];
+        const prayerOrder = [
+          'Fajr',
+          'Dhuhr',
+          'Asr',
+          'Maghrib',
+          'Isha',
+        ];
 
         String? nextPrayer;
         DateTime? nextPrayerDate;
@@ -516,9 +829,18 @@ class _HomePageState extends State<HomePage> {
 
         if (nextPrayer == null) {
           nextPrayer = 'Fajr';
+
           final fajr = parsePrayerTime(times['Fajr']);
+
           if (fajr != null) {
-            nextPrayerDate = fajr.add(const Duration(days: 1));
+            // Build tomorrow's Fajr using the city's calendar date.
+            nextPrayerDate = _makeCityDateTime(
+              fajr.year,
+              fajr.month,
+              fajr.day + 1,
+              fajr.hour,
+              fajr.minute,
+            );
           }
         }
 
@@ -528,6 +850,7 @@ class _HomePageState extends State<HomePage> {
         );
 
         final remaining = nextPrayerDate?.difference(_now);
+
         final remainingText = remaining == null
             ? ''
             : remaining.inHours > 0
@@ -577,10 +900,12 @@ class _HomePageState extends State<HomePage> {
                     width: 58,
                     height: 58,
                     decoration: BoxDecoration(
-                      color: (isDark ? _darkAccent : gold).withValues(alpha: 0.18),
+                      color: (isDark ? _darkAccent : gold)
+                          .withValues(alpha: 0.18),
                       borderRadius: BorderRadius.circular(20),
                       border: Border.all(
-                        color: (isDark ? _darkAccent : gold).withValues(alpha: 0.4),
+                        color: (isDark ? _darkAccent : gold)
+                            .withValues(alpha: 0.4),
                       ),
                     ),
                     child: Icon(
@@ -655,7 +980,8 @@ class _HomePageState extends State<HomePage> {
               child: ListView.separated(
                 scrollDirection: Axis.horizontal,
                 itemCount: _prayers.length,
-                separatorBuilder: (_, index) => const SizedBox(width: 10),
+                separatorBuilder: (_, index) =>
+                const SizedBox(width: 10),
                 itemBuilder: (context, index) {
                   final prayer = _prayers[index];
                   final name = prayer['name'] as String;
@@ -670,7 +996,9 @@ class _HomePageState extends State<HomePage> {
                           prayer['icon'] as IconData,
                           color: isNext
                               ? accent
-                              : (isDark ? _darkSecondaryText : const Color(0xFF8DDCC6)),
+                              : (isDark
+                              ? _darkSecondaryText
+                              : const Color(0xFF8DDCC6)),
                           size: 23,
                         ),
                         const SizedBox(height: 6),
@@ -782,18 +1110,24 @@ class _HomePageState extends State<HomePage> {
                   vertical: 7,
                 ),
                 decoration: BoxDecoration(
-                  color: (isDark ? _darkAccent : const Color(0xFFC8B197))
+                  color: (isDark
+                      ? _darkAccent
+                      : const Color(0xFFC8B197))
                       .withValues(alpha: 0.15),
                   borderRadius: BorderRadius.circular(30),
                   border: Border.all(
-                    color: (isDark ? _darkAccent : const Color(0xFFC8B197))
+                    color: (isDark
+                        ? _darkAccent
+                        : const Color(0xFFC8B197))
                         .withValues(alpha: 0.3),
                   ),
                 ),
                 child: Text(
                   '$completed / 5',
                   style: TextStyle(
-                    color: isDark ? _darkAccent : const Color(0xFFE2CBAE),
+                    color: isDark
+                        ? _darkAccent
+                        : const Color(0xFFE2CBAE),
                     fontWeight: FontWeight.bold,
                   ),
                 ),
@@ -825,7 +1159,8 @@ class _HomePageState extends State<HomePage> {
                     strokeWidth: 9,
                     strokeCap: StrokeCap.round,
                     backgroundColor: Colors.transparent,
-                    valueColor: AlwaysStoppedAnimation<Color>(accent),
+                    valueColor:
+                    AlwaysStoppedAnimation<Color>(accent),
                   ),
                 ),
                 Column(
@@ -833,7 +1168,9 @@ class _HomePageState extends State<HomePage> {
                   children: [
                     Icon(
                       Icons.mosque_rounded,
-                      color: isDark ? _darkAccent : const Color(0xFFC8B197),
+                      color: isDark
+                          ? _darkAccent
+                          : const Color(0xFFC8B197),
                       size: 27,
                     ),
                     const SizedBox(height: 7),
@@ -878,15 +1215,7 @@ class _HomePageState extends State<HomePage> {
                 borderRadius: BorderRadius.circular(17),
                 child: InkWell(
                   borderRadius: BorderRadius.circular(17),
-                  onTap: () {
-                    setState(() {
-                      if (checked) {
-                        _prayed.remove(name);
-                      } else {
-                        _prayed.add(name);
-                      }
-                    });
-                  },
+                  onTap: () => _handlePrayerTap(name),
                   child: Padding(
                     padding: const EdgeInsets.symmetric(
                       horizontal: 13,
@@ -911,7 +1240,9 @@ class _HomePageState extends State<HomePage> {
                                 : Icons.circle_outlined,
                             color: checked
                                 ? accent
-                                : (isDark ? _darkSecondaryText : Colors.white54),
+                                : (isDark
+                                ? _darkSecondaryText
+                                : Colors.white54),
                             size: 21,
                           ),
                         ),
@@ -931,7 +1262,9 @@ class _HomePageState extends State<HomePage> {
                         Text(
                           arabic,
                           style: TextStyle(
-                            color: isDark ? _darkAccent : const Color(0xFFC8B197),
+                            color: isDark
+                                ? _darkAccent
+                                : const Color(0xFFC8B197),
                             fontSize: 13,
                           ),
                         ),
@@ -942,7 +1275,9 @@ class _HomePageState extends State<HomePage> {
                               : Icons.circle_outlined,
                           color: checked
                               ? accent
-                              : (isDark ? _darkSecondaryText : Colors.white30),
+                              : (isDark
+                              ? _darkSecondaryText
+                              : Colors.white30),
                           size: 21,
                         ),
                       ],
@@ -1008,7 +1343,8 @@ class _HomePageState extends State<HomePage> {
                     Text(
                       'Continue Reading',
                       style: TextStyle(
-                        color: isDark ? _darkSecondaryText : Colors.white70,
+                        color:
+                        isDark ? _darkSecondaryText : Colors.white70,
                       ),
                     ),
                     const SizedBox(height: 8),
@@ -1030,7 +1366,8 @@ class _HomePageState extends State<HomePage> {
                           ? 'Surah $_lastSurahNumber • Page $_lastPageNumber'
                           : 'Tap to choose a Surah',
                       style: TextStyle(
-                        color: isDark ? _darkSecondaryText : Colors.white70,
+                        color:
+                        isDark ? _darkSecondaryText : Colors.white70,
                       ),
                     ),
                   ],
@@ -1101,7 +1438,7 @@ class _HomePageState extends State<HomePage> {
                 icon: Icons.auto_stories_rounded,
                 label: 'Hadith',
                 isDark: isDark,
-                onTap: () => _showComingSoon('Hadith'),
+                onTap: () => context.push('/hadith'),
               ),
               _navHomeItem(isDark),
               _navItem(
@@ -1138,7 +1475,10 @@ class _HomePageState extends State<HomePage> {
               end: Alignment.bottomRight,
               colors: isDark
                   ? const [_darkAccent, _darkPrimary]
-                  : const [Color(0xFF9BF2D5), Color(0xFF55CDA8)],
+                  : const [
+                Color(0xFF9BF2D5),
+                Color(0xFF55CDA8),
+              ],
             ),
             borderRadius: BorderRadius.circular(20),
             border: Border.all(
@@ -1147,7 +1487,9 @@ class _HomePageState extends State<HomePage> {
             ),
             boxShadow: [
               BoxShadow(
-                color: (isDark ? _darkAccent : const Color(0xFF68D9B8))
+                color: (isDark
+                    ? _darkAccent
+                    : const Color(0xFF68D9B8))
                     .withValues(alpha: 0.32),
                 blurRadius: 16,
                 spreadRadius: 1,
@@ -1185,7 +1527,9 @@ class _HomePageState extends State<HomePage> {
               Icon(
                 icon,
                 size: 23,
-                color: isDark ? _darkSecondaryText : const Color(0xFFB8D6CF),
+                color: isDark
+                    ? _darkSecondaryText
+                    : const Color(0xFFB8D6CF),
               ),
               const SizedBox(height: 5),
               Text(
@@ -1193,7 +1537,9 @@ class _HomePageState extends State<HomePage> {
                 maxLines: 1,
                 style: TextStyle(
                   fontSize: 10,
-                  color: isDark ? _darkText : const Color(0xFFD5E8E2),
+                  color: isDark
+                      ? _darkText
+                      : const Color(0xFFD5E8E2),
                   fontWeight: FontWeight.w500,
                 ),
               ),
@@ -1215,7 +1561,9 @@ class _HomePageState extends State<HomePage> {
             children: [
               Icon(
                 Icons.auto_awesome_rounded,
-                color: isDark ? _darkAccent : const Color(0xFF9BF2D5),
+                color: isDark
+                    ? _darkAccent
+                    : const Color(0xFF9BF2D5),
                 size: 22,
               ),
               const SizedBox(width: 12),
@@ -1230,7 +1578,8 @@ class _HomePageState extends State<HomePage> {
               ),
             ],
           ),
-          backgroundColor: isDark ? _darkPrimary : const Color(0xFF176B55),
+          backgroundColor:
+          isDark ? _darkPrimary : const Color(0xFF176B55),
           behavior: SnackBarBehavior.fixed,
           duration: const Duration(seconds: 2),
           elevation: 0,

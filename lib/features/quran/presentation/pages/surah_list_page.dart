@@ -1,7 +1,6 @@
 import 'package:flutter/material.dart';
 import 'package:flutter_bloc/flutter_bloc.dart';
 import 'package:go_router/go_router.dart';
-
 import '../../../../core/cubit/theme_cubit.dart';
 import '../../../../core/di/injection_container.dart';
 import '../../../../core/utils/app_colors.dart';
@@ -762,7 +761,7 @@ class _SurahListPageState extends State<SurahListPage> {
                 icon: Icons.auto_stories_rounded,
                 label: 'Hadith',
                 isDark: isDark,
-                onTap: () => _showComingSoon('Hadith'),
+                onTap: () => context.go('/hadith'),
               ),
               _navHomeItem(isDark),
               _navItem(
